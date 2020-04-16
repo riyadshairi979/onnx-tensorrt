@@ -65,6 +65,7 @@ void printSubGraphs(SubGraphCollection_t& subGraphs, ::ONNX_NAMESPACE::ModelProt
         }
         else
         {
+            // Because of having some unsupported nodes
             cout << "UNKNOWN whether this is fully supported." << endl; 
         }
     }

@@ -377,6 +377,7 @@ bool ModelImporter::supportsModel(
         }
         else
         {
+            cout << "Not supported: " << node.op_type() << endl;
             // This is not a supported node, reset newSubGraph
             newSubGraph = true;
             allSupported = false;
