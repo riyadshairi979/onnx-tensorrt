@@ -26,6 +26,7 @@
 #include "NvInfer.h"
 #include <stddef.h>
 #include <vector>
+#define TENSORRTAPI
 
 #define NV_ONNX_PARSER_MAJOR 0
 #define NV_ONNX_PARSER_MINOR 1
