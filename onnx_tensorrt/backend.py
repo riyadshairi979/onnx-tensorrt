@@ -28,6 +28,7 @@ from onnx import helper as onnx_helper
 from onnx import numpy_helper
 import numpy as np
 import six
+from .calibration import TensorBatchDataset, DatasetCalibrator, DEFAULT_CALIBRATION_ALGORITHM
 
 # HACK Should look for a better way/place to do this
 from ctypes import cdll, c_char_p
@@ -50,7 +51,7 @@ def count_trailing_ones(vals):
 _config = Config()
 
 if _config.USE_PYBIND:
-    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 
 if not _config.USE_PYBIND:
     from . import parser
@@ -58,14 +59,24 @@ if not _config.USE_PYBIND:
 
 
 class TensorRTBackendRep(BackendRep):
-    def __init__(self, model, device, max_batch_size=32,
-                 max_workspace_size=None, serialize_engine=False, **kwargs):
+    def __init__(self,
+                 model,
+                 device,
+                 max_batch_size=32,
+                 max_workspace_size=None,
+                 serialize_engine=False,
+                 fp16_mode=False,
+                 int8_mode=False,
+                 strict_type_constraints=False,
+                 int8_calib_algorithm=DEFAULT_CALIBRATION_ALGORITHM,
+                 **kwargs):
         if not isinstance(device, Device):
             device = Device(device)
         self._set_device(device)
         self._logger = TRT_LOGGER
         self.builder = trt.Builder(self._logger)
         self.network = self.builder.create_network(flags=1 << (int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        # self.network = self.builder.create_network()
         self.parser = trt.OnnxParser(self.network, self._logger)
 
         if not isinstance(model, six.string_types):
@@ -76,7 +87,7 @@ class TensorRTBackendRep(BackendRep):
         if not trt.init_libnvinfer_plugins(TRT_LOGGER, ""):
             msg = "Failed to initialize TensorRT's plugin library."
             raise RuntimeError(msg)
-        
+
         if not self.parser.parse(model_str):
             error = self.parser.get_error(0)
             msg = "While parsing node number %i:\n" % error.node()
@@ -89,11 +100,24 @@ class TensorRTBackendRep(BackendRep):
 
         self.builder.max_batch_size = max_batch_size
         self.builder.max_workspace_size = max_workspace_size
+        self.builder.fp16_mode = fp16_mode
+        self.builder.strict_type_constraints = strict_type_constraints
 
-        for layer in self.network:
-            print(layer.name)
+        # int8_mode support
+        if int8_mode:
+            # default to use input tensors for calibration
+            if int8_calib_dataset is None:
+                int8_calib_dataset = TensorBatchDataset(inputs_in)
 
-        print(self.network[-1].get_output(0).shape)
+            self.builder.int8_mode = True
+
+            # torch2trt says: Should we set batch_size=max_batch_size?  Need to investigate memory consumption
+            self.builder.int8_calibrator = DatasetCalibrator(inputs, int8_calib_dataset, batch_size=1, algorithm=int8_calib_algorithm)
+
+        # for layer in self.network:
+        #     print(layer.name)
+
+        # print(self.network[-1].get_output(0).shape)
 
         trt_engine = self.builder.build_cuda_engine(self.network)
         if trt_engine is None:
@@ -108,10 +132,12 @@ class TensorRTBackendRep(BackendRep):
             output_shape = tuple([dim.dim_value for dim in dims])
             self._output_shapes[output.name] = output_shape
             self._output_dtype[output.name] = output.type.tensor_type.elem_type
+
     def _set_device(self, device):
         self.device = device
         assert(device.type == DeviceType.CUDA)
         cudaSetDevice(device.device_id)
+
     def _serialize_deserialize(self, trt_engine):
         self.runtime = trt.Runtime(TRT_LOGGER)
         serialized_engine = trt_engine.serialize()
@@ -119,6 +145,7 @@ class TensorRTBackendRep(BackendRep):
         trt_engine = self.runtime.deserialize_cuda_engine(
                 serialized_engine)
         return trt_engine
+
     def run(self, inputs, **kwargs):
         """Execute the prepared engine and return the outputs as a named tuple.
         inputs -- Input tensor(s) as a Numpy array or list of Numpy arrays.
@@ -198,6 +225,7 @@ class TensorRTBackend(Backend):
         """
         super(TensorRTBackend, cls).prepare(model, device, **kwargs)
         return TensorRTBackendRep(model, device, **kwargs)
+
     @classmethod
     def run_model(cls, model, inputs, device='CUDA:0', **kwargs):
         """Build and run an engine from the given model.
@@ -206,6 +234,7 @@ class TensorRTBackend(Backend):
         inputs -- Input tensor(s) as a Numpy array or list of Numpy arrays.
         """
         return cls.prepare(model, device, **kwargs).run(inputs)
+
     @classmethod
     def run_node(cls, node, inputs, device='CUDA:0'):
         """Build and run an engine from the given node.
@@ -223,6 +252,7 @@ class TensorRTBackend(Backend):
             model = make_node_test_model(node, inputs, use_weights=False)
             results = TensorRTBackend.prepare(model, device).run(inputs)
         return results
+
     @classmethod
     def supports_device(cls, device_str):
         device = Device(device_str)
