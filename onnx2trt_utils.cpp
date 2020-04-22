@@ -431,7 +431,21 @@ nvinfer1::ITensor& convertToTensor(TensorOrWeights& input, IImporterContext* ctx
     {
         // Handle non-tensor indices input by adding a new constant layer to the network.
         ShapedWeights& weights = input.weights();
-        return *(ctx->network()->addConstant(weights.shape, weights)->getOutput(0));
+        // Note the TRT doesn't natively handle boolean weights. First create an INT32 weights copy of the boolean weights, then cast it back to bool within TRT.
+        if (weights.type == ::ONNX_NAMESPACE::TensorProto::BOOL)
+        {
+            ShapedWeights convertedWeights = ctx->createTempWeights(::ONNX_NAMESPACE::TensorProto::INT32, weights.shape);
+            int* intValues = static_cast<int*>(weights.values);
+            std::memcpy(convertedWeights.values, intValues, weights.count() * sizeof(int));
+            auto* boolTensor = ctx->network()->addConstant(convertedWeights.shape, convertedWeights)->getOutput(0);
+            auto* castLayer = ctx->network()->addIdentity(*boolTensor);
+            castLayer->setOutputType(0,nvinfer1::DataType::kBOOL);
+            return *(castLayer->getOutput(0));
+        }
+        else
+        {
+            return *(ctx->network()->addConstant(weights.shape, weights)->getOutput(0));
+        }
     }
 }
 
@@ -754,7 +768,7 @@ int getDtypeSize(int32_t onnxDtype)
     case ::ONNX_NAMESPACE::TensorProto::UINT32:
         return 4;
     // Booleans are stored in int32 tensors in ONNX
-    case ::ONNX_NAMESPACE::TensorProto::BOOL: return 4;
+    case ::ONNX_NAMESPACE::TensorProto::BOOL: return 1;
     case ::ONNX_NAMESPACE::TensorProto::INT32: return 4;
     case ::ONNX_NAMESPACE::TensorProto::UINT64: return 8;
     case ::ONNX_NAMESPACE::TensorProto::INT64: return 8;
@@ -1473,6 +1487,82 @@ nvinfer1::ITensor* transposeTensor(
         layer->setReshapeDimensions(new_shape);
     }
     return layer->getOutput(0);
+}
+
+bool supportsShapeTensor(nvinfer1::LayerType type, nvinfer1::ElementWiseOperation eleOp, nvinfer1::ReduceOperation redOp)
+{
+    switch (type)
+        {
+        // Layers that allow shape output
+        case nvinfer1::LayerType::kCONCATENATION:
+        case nvinfer1::LayerType::kCONSTANT:
+        case nvinfer1::LayerType::kGATHER:
+        case nvinfer1::LayerType::kIDENTITY:
+        case nvinfer1::LayerType::kPADDING:
+        case nvinfer1::LayerType::kSHAPE:
+        case nvinfer1::LayerType::kSHUFFLE:
+        case nvinfer1::LayerType::kSLICE: return true;
+        // Layers that do not allow shape output
+        case nvinfer1::LayerType::kACTIVATION:
+        case nvinfer1::LayerType::kCONVOLUTION:
+        case nvinfer1::LayerType::kDECONVOLUTION:
+        case nvinfer1::LayerType::kFULLY_CONNECTED:
+        case nvinfer1::LayerType::kITERATOR:
+        case nvinfer1::LayerType::kLOOP_OUTPUT:
+        case nvinfer1::LayerType::kLRN:
+        case nvinfer1::LayerType::kMATRIX_MULTIPLY:
+        case nvinfer1::LayerType::kPARAMETRIC_RELU:
+        case nvinfer1::LayerType::kPLUGIN:
+        case nvinfer1::LayerType::kPLUGIN_V2:
+        case nvinfer1::LayerType::kPOOLING:
+        case nvinfer1::LayerType::kRAGGED_SOFTMAX:
+        case nvinfer1::LayerType::kRECURRENCE:
+        case nvinfer1::LayerType::kRESIZE:
+        case nvinfer1::LayerType::kRNN:
+        case nvinfer1::LayerType::kRNN_V2:
+        case nvinfer1::LayerType::kSCALE:
+        case nvinfer1::LayerType::kSELECT:
+        case nvinfer1::LayerType::kSOFTMAX:
+        case nvinfer1::LayerType::kTRIP_LIMIT:
+        case nvinfer1::LayerType::kTOPK:
+        case nvinfer1::LayerType::kFILL:
+        case nvinfer1::LayerType::kUNARY: return false;
+        // Layers that have partial support for shape tensor outputs
+        case nvinfer1::LayerType::kELEMENTWISE:
+            switch(eleOp)
+            {
+                // Supported elementwise operations
+                case nvinfer1::ElementWiseOperation::kSUM:
+                case nvinfer1::ElementWiseOperation::kSUB:
+                case nvinfer1::ElementWiseOperation::kPROD:
+                case nvinfer1::ElementWiseOperation::kDIV:
+                case nvinfer1::ElementWiseOperation::kFLOOR_DIV:
+                case nvinfer1::ElementWiseOperation::kMIN:
+                case nvinfer1::ElementWiseOperation::kMAX: return true;
+                // Unsupported elementwise operations
+                case nvinfer1::ElementWiseOperation::kPOW:
+                case nvinfer1::ElementWiseOperation::kAND:
+                case nvinfer1::ElementWiseOperation::kOR:
+                case nvinfer1::ElementWiseOperation::kXOR:
+                case nvinfer1::ElementWiseOperation::kEQUAL:
+                case nvinfer1::ElementWiseOperation::kGREATER:
+                case nvinfer1::ElementWiseOperation::kLESS: return false;
+            }
+            return false;
+        case nvinfer1::LayerType::kREDUCE:
+            switch(redOp)
+            {
+                // Supported reduce operations
+                case nvinfer1::ReduceOperation::kSUM:
+                case nvinfer1::ReduceOperation::kMAX:
+                case nvinfer1::ReduceOperation::kMIN:
+                case nvinfer1::ReduceOperation::kPROD: return true;
+                // Unsupported reduce operations
+                case nvinfer1::ReduceOperation::kAVG: return false;
+            }
+            return false;
+        }
+    return false;
 }
 
 NodeImportResult unaryHelper(IImporterContext* ctx, TensorOrWeights& input, nvinfer1::UnaryOperation op)
